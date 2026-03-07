@@ -172,7 +172,7 @@ class DingTalkHandler:
 
         # --- 邮箱智能回退 ---
         # 优先用企业邮箱，其次个人邮箱，最后用 userid 兜底防报错
-        email = user_info.get('org_email') or user_info.get('email') or f"{userid}@dingtalk.local"
+        email = user_info.get('org_email') or user_info.get('email') or ''
 
         # --- 动态权限与组装 (RBAC 核心) ---
         # 1. 解析钉钉角色 (role_list)
@@ -210,6 +210,10 @@ class DingTalkHandler:
             'phone_number': user_info.get('mobile', ''),
 
             # 自定义扩展声明 (下游系统可以直接通过 JSON Path 提取这些值用于鉴权)
+
+            'userid_email' : f"{userid}@userid.dingtalk",
+            'unionid_email' : f"{unionid}@unionid.dingtalk",
+            'unionid' : unionid,
             'title': user_info.get('title', ''),
             'is_admin': is_admin,  # 布尔值，非常适合 Grafana 判断
             'job_number': user_info.get('job_number', ''),
