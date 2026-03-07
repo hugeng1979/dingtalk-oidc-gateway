@@ -80,29 +80,28 @@ class UserTokenCache:
         with open(self.file_path, 'wb') as file:
             pickle.dump(data, file)
 
-    def set_user_token(self, unionid, name, token):
+    def set_user_token(self, unionid, user_info: dict, token: str):
         data = self._read_data()
         data[unionid] = {
-            "name": name,
+            "user_info": user_info,  # 存储完整的字典
             "token": token,
             "updated_at": int(time.time())
         }
         self._write_data(data)
 
     def get_valid_token(self, unionid):
-        """获取有效的 Token，如果过期返回 None"""
         data = self._read_data().get(unionid, {})
-        name = data.get('name')
+        user_info = data.get('user_info')
         token = data.get('token')
         updated_at = data.get('updated_at', 0)
 
-        if name and token:
+        if user_info and token:
             if time.time() - updated_at > settings.user_token_cache_expire:
-                logging.info(f"{Fore.YELLOW}本地缓存的用户 {name} Token 已过期。{Style.RESET_ALL}")
+                logging.info(f"{Fore.YELLOW}本地缓存的用户 Token 已过期。{Style.RESET_ALL}")
                 return None, None
             else:
-                logging.info(f"命中本地文件缓存，用户: {Fore.CYAN}{name}{Fore.RESET}")
-                return name, token
+                logging.info(f"命中本地文件缓存，用户: {Fore.CYAN}{user_info.get('name')}{Fore.RESET}")
+                return user_info, token
         return None, None
 
 
@@ -163,21 +162,63 @@ class DingTalkHandler:
         return user_info_resp.get('result', {})
 
     @staticmethod
-    def _generate_oidc_token(user_name: str, client_id: str):
-        """生成符合 OIDC 规范的 RS256 JWT，受众(aud)直接设定为下游传入的 client_id"""
+    def _generate_oidc_token(user_info: dict, client_id: str):
         now = int(time.time())
+
+        # --- 基础信息提取 ---
+        userid = user_info.get('userid', '')
+        unionid = user_info.get('unionid', '')
+        name = user_info.get('name', 'Unknown')
+
+        # --- 邮箱智能回退 ---
+        # 优先用企业邮箱，其次个人邮箱，最后用 userid 兜底防报错
+        email = user_info.get('org_email') or user_info.get('email') or f"{userid}@dingtalk.local"
+
+        # --- 动态权限与组装 (RBAC 核心) ---
+        # 1. 解析钉钉角色 (role_list)
+        roles = []
+        role_list = user_info.get('role_list', [])
+        if isinstance(role_list, list):
+            for r in role_list:
+                if isinstance(r, dict) and 'name' in r:
+                    roles.append(r['name'])
+
+        groups = [settings.grafana_organizations]
+        if roles:
+            groups.extend(roles)  # 把钉钉的 "总监" 等角色塞进 groups 列表
+
+        # 2. 判断是否是管理员 (依据钉钉的 admin 或 boss 字段)
+        is_admin = (user_info.get('admin') == 'true') or (user_info.get('boss') == 'true')
+
+        # 3. 为强依赖 "role" 字段的简单系统提供兜底映射
+        app_role = 'Admin' if is_admin else 'Viewer'
+
+        # --- 构建丰富的 JWT Payload ---
         payload = {
+            # 标准协议保留字
             'iss': settings.oidc_issuer,
-            'sub': user_name,
+            'sub': userid,  # 强烈建议用 unionid 作为全局唯一标识，而不是名字
             'aud': client_id,
             'exp': now + settings.user_token_cache_expire,
             'iat': now,
-            'name': user_name,
-            'preferred_username': user_name,
-            'email': f"{user_name}@dingtalk.local",
+
+            # OIDC 标准 User Profile 声明
+            'name': name,
+            'preferred_username': name,
+            'email': email,
+            'picture': user_info.get('avatar', ''),
+            'phone_number': user_info.get('mobile', ''),
+
+            # 自定义扩展声明 (下游系统可以直接通过 JSON Path 提取这些值用于鉴权)
+            'title': user_info.get('title', ''),
+            'is_admin': is_admin,  # 布尔值，非常适合 Grafana 判断
+            'job_number': user_info.get('job_number', ''),
+            'dept_id_list': user_info.get('dept_id_list', []),
+
+            # 兼容各路系统的组和角色
             'organizations': [settings.grafana_organizations],
-            'groups': [settings.grafana_organizations],
-            'role': 'Viewer'
+            'groups': groups,  # 包含基础配置组 + 钉钉动态角色
+            'role': app_role  # Admin 或 Viewer
         }
 
         return jwt.encode(
@@ -210,17 +251,19 @@ class DingTalkHandler:
         ).json()
         unionid = me_resp.get('unionId')
 
-        user_name, oidc_token = self.cache_manager.get_valid_token(unionid)
+        # 缓存校验现在返回完整的 user_info
+        user_info, oidc_token = self.cache_manager.get_valid_token(unionid)
         if not oidc_token:
+            # 去钉钉拉取完整的用户字典
             user_info = self._get_user_info_from_dingtalk(unionid, client_id, client_secret)
-            user_name = user_info.get('name') if user_info else None
+            if not user_info:
+                return {}
 
-            if not user_name: return {}
+            # 将整个大字典传给签发函数
+            oidc_token = self._generate_oidc_token(user_info, client_id)
+            self.cache_manager.set_user_token(unionid, user_info, oidc_token)
 
-            oidc_token = self._generate_oidc_token(user_name, client_id)
-            self.cache_manager.set_user_token(unionid, user_name, oidc_token)
-
-        logging.info(f"用户 {Fore.GREEN}{user_name}{Fore.RESET} 登录流程处理完成 (Client: {client_id[:6]}...)。")
+        logging.info(f"用户 {Fore.GREEN}{user_info.get('name')}{Fore.RESET} 登录流程处理完成...")
 
         return {
             'access_token': oidc_token,

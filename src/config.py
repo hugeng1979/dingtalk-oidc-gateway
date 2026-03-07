@@ -4,10 +4,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from colorama import Fore, Style
 
 class Settings(BaseSettings):
-    # --- 钉钉 OIDC 配置 ---
-    # dt_client_id: str
-    # dt_client_secret: str
-
     # --- 服务端配置 ---
     oidc_issuer: str = "http://localhost:8000"
     grafana_organizations: str = "Main Org"
