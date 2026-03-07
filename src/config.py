@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     # --- 日志配置 ---
     log_level: str = "INFO"
 
+    client_email_mapping: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

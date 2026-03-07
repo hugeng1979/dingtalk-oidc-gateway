@@ -3,7 +3,7 @@ import time
 import os
 import json
 import base64
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 import jwt
@@ -61,7 +61,7 @@ class KeyManager:
 key_manager = KeyManager()
 
 
-# --- 数据持久化 (Pickle 版本) ---
+# --- 数据持久化 (Pickle 版本，仅缓存 UserInfo) ---
 class UserTokenCache:
     def __init__(self, file_path=settings.cache_file_path):
         self.file_path = file_path
@@ -80,36 +80,34 @@ class UserTokenCache:
         with open(self.file_path, 'wb') as file:
             pickle.dump(data, file)
 
-    def set_user_token(self, unionid, user_info: dict, token: str):
+    def set_user_info(self, unionid, user_info: dict):
         data = self._read_data()
         data[unionid] = {
-            "user_info": user_info,  # 存储完整的字典
-            "token": token,
+            "user_info": user_info,  # 仅存储从钉钉拉回的用户大字典
             "updated_at": int(time.time())
         }
         self._write_data(data)
 
-    def get_valid_token(self, unionid):
+    def get_valid_user_info(self, unionid):
+        """获取有效的用户信息，如果过期返回 None"""
         data = self._read_data().get(unionid, {})
         user_info = data.get('user_info')
-        token = data.get('token')
         updated_at = data.get('updated_at', 0)
 
-        if user_info and token:
+        if user_info:
             if time.time() - updated_at > settings.user_token_cache_expire:
-                logging.info(f"{Fore.YELLOW}本地缓存的用户 Token 已过期。{Style.RESET_ALL}")
-                return None, None
+                logging.info(f"{Fore.YELLOW}本地缓存的用户信息已过期。{Style.RESET_ALL}")
+                return None
             else:
                 logging.info(f"命中本地文件缓存，用户: {Fore.CYAN}{user_info.get('name')}{Fore.RESET}")
-                return user_info, token
-        return None, None
+                return user_info
+        return None
 
 
 # --- 钉钉与 OIDC 业务处理 ---
 class DingTalkHandler:
     def __init__(self):
         self.cache_manager = UserTokenCache()
-        # 改造为多租户缓存: { "client_id": {"token": "xxx", "expires_at": 123} }
         self._app_token_cache = {}
 
     def _get_app_access_token(self, client_id: str, client_secret: str):
@@ -140,7 +138,6 @@ class DingTalkHandler:
         raise Exception("DingTalk App Token Error")
 
     def _get_user_info_from_dingtalk(self, unionid: str, client_id: str, client_secret: str):
-        """动态传入凭证获取用户信息"""
         app_token = self._get_app_access_token(client_id, client_secret)
 
         userid_resp = httpx.post(
@@ -162,20 +159,53 @@ class DingTalkHandler:
         return user_info_resp.get('result', {})
 
     @staticmethod
-    def _generate_oidc_token(user_info: dict, client_id: str):
-        now = int(time.time())
+    def _get_dynamic_email(user_info: dict, redirect_uri: str) -> str:
+        """根据 redirect_uri 的特征关键词解析邮箱策略"""
+        # 注意：要在 config.py 的 Settings 类中增加 client_email_mapping: str = ""
+        rule_str = getattr(settings, 'client_email_mapping', '').strip()
+        strategy = "email"  # 默认策略为真实邮箱
 
-        # --- 基础信息提取 ---
+        # 关键词匹配逻辑 (例如 .env 中配置 CLIENT_EMAIL_MAPPING="grafana|userid;dify|name_uri")
+        if rule_str and redirect_uri:
+            redirect_uri_lower = redirect_uri.lower()
+            for rule in rule_str.split(';'):
+                parts = [p.strip() for p in rule.split('|') if p.strip()]
+                if len(parts) >= 2:
+                    keyword = parts[0].lower()
+                    if keyword in redirect_uri_lower:
+                        strategy = parts[1].lower()
+                        break
+
         userid = user_info.get('userid', '')
         unionid = user_info.get('unionid', '')
         name = user_info.get('name', 'Unknown')
 
-        # --- 邮箱智能回退 ---
-        # 优先用企业邮箱，其次个人邮箱，最后用 userid 兜底防报错
-        email = user_info.get('org_email') or user_info.get('email') or ''
+        if strategy == 'email':
+            return user_info.get('email')
+        elif strategy == 'org_email':
+            return user_info.get('org_email')
+        elif strategy == 'userid':
+            return f"{userid}@userid.dingtalk"
+        elif strategy == 'unionid':
+            return f"{unionid}@unionid.dingtalk"
+        elif strategy == 'name':
+            return f"{name}@name.dingtalk"
+        elif strategy == 'name_uri':
+            return f"{quote(name)}@name.dingtalk"
+        else:
+            return ''
 
-        # --- 动态权限与组装 (RBAC 核心) ---
-        # 1. 解析钉钉角色 (role_list)
+    @staticmethod
+    def _generate_oidc_token(user_info: dict, client_id: str, redirect_uri: str):
+        now = int(time.time())
+
+        userid = user_info.get('userid', '')
+        unionid = user_info.get('unionid', '')
+        name = user_info.get('name', 'Unknown')
+
+        # === 核心：传入 redirect_uri 获取专属于该系统的邮箱 ===
+        dynamic_email = DingTalkHandler._get_dynamic_email(user_info, redirect_uri)
+
         roles = []
         role_list = user_info.get('role_list', [])
         if isinstance(role_list, list):
@@ -185,44 +215,36 @@ class DingTalkHandler:
 
         groups = [settings.grafana_organizations]
         if roles:
-            groups.extend(roles)  # 把钉钉的 "总监" 等角色塞进 groups 列表
+            groups.extend(roles)
 
-        # 2. 判断是否是管理员 (依据钉钉的 admin 或 boss 字段)
         is_admin = (user_info.get('admin') == 'true') or (user_info.get('boss') == 'true')
-
-        # 3. 为强依赖 "role" 字段的简单系统提供兜底映射
         app_role = 'Admin' if is_admin else 'Viewer'
 
-        # --- 构建丰富的 JWT Payload ---
         payload = {
-            # 标准协议保留字
             'iss': settings.oidc_issuer,
-            'sub': userid,  # 强烈建议用 unionid 作为全局唯一标识，而不是名字
+            'sub': userid,  # 强烈建议用 userid 或 unionid 作为全局唯一标识
             'aud': client_id,
             'exp': now + settings.user_token_cache_expire,
             'iat': now,
 
-            # OIDC 标准 User Profile 声明
             'name': name,
             'preferred_username': name,
-            'email': email,
+
+            # === 将伪装后的邮箱直接覆盖掉标准 email 声明 ===
+            'email': dynamic_email,
+
             'picture': user_info.get('avatar', ''),
             'phone_number': user_info.get('mobile', ''),
 
-            # 自定义扩展声明 (下游系统可以直接通过 JSON Path 提取这些值用于鉴权)
-
-            'userid_email' : f"{userid}@userid.dingtalk",
-            'unionid_email' : f"{unionid}@unionid.dingtalk",
-            'unionid' : unionid,
+            'unionid': unionid,
             'title': user_info.get('title', ''),
-            'is_admin': is_admin,  # 布尔值，非常适合 Grafana 判断
+            'is_admin': is_admin,
             'job_number': user_info.get('job_number', ''),
             'dept_id_list': user_info.get('dept_id_list', []),
 
-            # 兼容各路系统的组和角色
             'organizations': [settings.grafana_organizations],
-            'groups': groups,  # 包含基础配置组 + 钉钉动态角色
-            'role': app_role  # Admin 或 Viewer
+            'groups': groups,
+            'role': app_role
         }
 
         return jwt.encode(
@@ -232,8 +254,8 @@ class DingTalkHandler:
             headers={"kid": key_manager.kid}
         )
 
-    async def process_login(self, code: str, grant_type: str, client_id: str, client_secret: str):
-        """透传 ClientID 和 ClientSecret 处理登录"""
+    async def process_login(self, code: str, grant_type: str, client_id: str, client_secret: str, redirect_uri: str):
+        """透传 ClientID, ClientSecret, 和 RedirectURI 处理登录"""
         user_access_resp = httpx.post(
             "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
             json={
@@ -255,19 +277,20 @@ class DingTalkHandler:
         ).json()
         unionid = me_resp.get('unionId')
 
-        # 缓存校验现在返回完整的 user_info
-        user_info, oidc_token = self.cache_manager.get_valid_token(unionid)
-        if not oidc_token:
-            # 去钉钉拉取完整的用户字典
+        # 1. 尝试从缓存提取完整 UserInfo
+        user_info = self.cache_manager.get_valid_user_info(unionid)
+        if not user_info:
+            # 2. 缓存中没有，去钉钉拉取
             user_info = self._get_user_info_from_dingtalk(unionid, client_id, client_secret)
             if not user_info:
                 return {}
+            self.cache_manager.set_user_info(unionid, user_info)
 
-            # 将整个大字典传给签发函数
-            oidc_token = self._generate_oidc_token(user_info, client_id)
-            self.cache_manager.set_user_token(unionid, user_info, oidc_token)
+        # 3. 动态签发（携带回调地址用于策略判断）
+        oidc_token = self._generate_oidc_token(user_info, client_id, redirect_uri)
 
-        logging.info(f"用户 {Fore.GREEN}{user_info.get('name')}{Fore.RESET} 登录流程处理完成...")
+        logging.info(
+            f"用户 {Fore.GREEN}{user_info.get('name')}{Fore.RESET} 登录完成。分配邮箱: {self._get_dynamic_email(user_info, redirect_uri)}")
 
         return {
             'access_token': oidc_token,
@@ -282,17 +305,6 @@ dingtalk_handler = DingTalkHandler()
 
 
 # --- 路由配置 ---
-
-@app.get("/config-check")
-async def check_config():
-    """测试接口（生产环境建议移除）"""
-    return {
-        "issuer": settings.oidc_issuer,
-        "cache_path": settings.cache_file_path,
-        "grafana_org": settings.grafana_organizations
-    }
-
-
 @app.get("/.well-known/openid-configuration")
 async def openid_configuration():
     """OIDC 自动发现端点"""
@@ -333,15 +345,16 @@ async def dingtalk_oauth(redirect_uri: str, response_type: str, client_id: str, 
 
 @app.post("/dingtalk/token")
 async def dingtalk_token(request: Request):
-    """Token 交换端点，动态提取并透传凭证"""
+    """Token 交换端点，动态提取凭证和回调地址"""
     body = await request.body()
     params = parse_qs(body.decode('utf-8'))
 
-    # 1. 尝试从表单获取客户端凭证
     client_id = params.get('client_id', [None])[0]
     client_secret = params.get('client_secret', [None])[0]
+    # 提取回调地址，交给业务层做邮箱分配策略判断
+    redirect_uri = params.get('redirect_uri', [''])[0]
 
-    # 2. 兼容从 HTTP Basic Auth 中获取 (如 Dify 默认行为)
+    # 兼容从 HTTP Basic Auth 中获取 (如 Dify 默认行为)
     auth_header = request.headers.get('Authorization')
     if auth_header and auth_header.startswith('Basic '):
         try:
@@ -361,7 +374,7 @@ async def dingtalk_token(request: Request):
         return {"error": "invalid_client", "error_description": "Missing client credentials"}
 
     if code and grant_type:
-        return await dingtalk_handler.process_login(code, grant_type, client_id, client_secret)
+        return await dingtalk_handler.process_login(code, grant_type, client_id, client_secret, redirect_uri)
 
     return {"error": "invalid_request"}
 
@@ -375,7 +388,7 @@ async def dingtalk_userinfo(request: Request):
 
     token = token_header.split(' ')[1]
     try:
-        # 透传模式下，不同客户端拥有不同的 aud，因此此处关闭 verify_aud，只验证签名和签发者
+        # 透传模式下，不同客户端拥有不同的 aud，关闭 verify_aud，只验证签名和签发者
         payload = jwt.decode(
             token,
             key_manager.public_key,
