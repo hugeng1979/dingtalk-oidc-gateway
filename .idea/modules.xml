@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/dintalk-oidc-gateway.iml" filepath="$PROJECT_DIR$/.idea/dintalk-oidc-gateway.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/dingtalk-oidc-gateway.iml" filepath="$PROJECT_DIR$/.idea/dingtalk-oidc-gateway.iml" />
     </modules>
   </component>
 </project>
