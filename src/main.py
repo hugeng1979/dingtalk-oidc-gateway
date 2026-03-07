@@ -2,8 +2,9 @@ import logging
 import time
 import os
 import json
+import base64
 from urllib.parse import parse_qs
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 import jwt
 from jwt.algorithms import RSAAlgorithm
@@ -23,6 +24,7 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+
 
 # --- RSA 密钥管理 (用于 RS256 和 JWKS) ---
 class KeyManager:
@@ -71,7 +73,6 @@ class UserTokenCache:
             with open(self.file_path, 'rb') as file:
                 return pickle.load(file)
         except (FileNotFoundError, EOFError, pickle.UnpicklingError):
-            # 捕获 EOFError 和 UnpicklingError 防止文件损坏导致程序崩溃
             return {}
 
     def _write_data(self, data):
@@ -109,34 +110,50 @@ class UserTokenCache:
 class DingTalkHandler:
     def __init__(self):
         self.cache_manager = UserTokenCache()
-        self._app_token_cache = {"token": None, "expires_at": 0}
+        # 改造为多租户缓存: { "client_id": {"token": "xxx", "expires_at": 123} }
+        self._app_token_cache = {}
 
-    def _get_app_access_token(self):
-        # ... (与原代码完全一致) ...
+    def _get_app_access_token(self, client_id: str, client_secret: str):
         current_time = time.time()
-        if self._app_token_cache["token"] and current_time < self._app_token_cache["expires_at"] - 60:
-            return self._app_token_cache["token"]
+        app_cache = self._app_token_cache.get(client_id, {"token": None, "expires_at": 0})
 
+        if app_cache["token"] and current_time < app_cache["expires_at"] - 60:
+            return app_cache["token"]
+
+        logging.info(
+            f"{Fore.YELLOW}App AccessToken 过期或不存在，正在使用 ClientID [{client_id[:6]}...] 请求钉钉 API...{Style.RESET_ALL}")
         resp = httpx.post(
             "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-            json={"appKey": settings.dt_client_id, "appSecret": settings.dt_client_secret}
+            json={"appKey": client_id, "appSecret": client_secret}
         ).json()
+
         token = resp.get('accessToken')
+        expire_in = resp.get('expireIn', 7200)
+
         if token:
-            self._app_token_cache = {"token": token, "expires_at": current_time + resp.get('expireIn', 7200)}
+            self._app_token_cache[client_id] = {
+                "token": token,
+                "expires_at": current_time + expire_in
+            }
             return token
+
+        logging.error(f"获取 App AccessToken 失败: {resp}")
         raise Exception("DingTalk App Token Error")
 
-    def _get_user_info_from_dingtalk(self, unionid):
-        # ... (与原代码完全一致) ...
-        app_token = self._get_app_access_token()
+    def _get_user_info_from_dingtalk(self, unionid: str, client_id: str, client_secret: str):
+        """动态传入凭证获取用户信息"""
+        app_token = self._get_app_access_token(client_id, client_secret)
+
         userid_resp = httpx.post(
             f"https://oapi.dingtalk.com/topapi/user/getbyunionid",
             params={"access_token": app_token},
             json={"unionid": unionid}
         ).json()
         userid = userid_resp.get('result', {}).get('userid')
-        if not userid: return None
+
+        if not userid:
+            logging.error(f"无法根据 UnionId 获取 UserId: {userid_resp}")
+            return None
 
         user_info_resp = httpx.post(
             f"https://oapi.dingtalk.com/topapi/v2/user/get",
@@ -146,20 +163,18 @@ class DingTalkHandler:
         return user_info_resp.get('result', {})
 
     @staticmethod
-    def _generate_oidc_token(user_name):
-        """生成符合 OIDC 规范的 RS256 JWT"""
+    def _generate_oidc_token(user_name: str, client_id: str):
+        """生成符合 OIDC 规范的 RS256 JWT，受众(aud)直接设定为下游传入的 client_id"""
         now = int(time.time())
         payload = {
             'iss': settings.oidc_issuer,
-            'sub': user_name,  # 通常是唯一ID，这里按原逻辑用 name
-            'aud': settings.dt_client_id,
+            'sub': user_name,
+            'aud': client_id,
             'exp': now + settings.user_token_cache_expire,
             'iat': now,
-
-            # 自定义 Claims (针对各类系统及中间件)
             'name': user_name,
             'preferred_username': user_name,
-            'email': f"{user_name}@dingtalk.local",  # Grafana 等系统通常需要 email
+            'email': f"{user_name}@dingtalk.local",
             'organizations': [settings.grafana_organizations],
             'groups': [settings.grafana_organizations],
             'role': 'Viewer'
@@ -172,41 +187,44 @@ class DingTalkHandler:
             headers={"kid": key_manager.kid}
         )
 
-    async def process_login(self, code: str, grant_type: str):
-        # 1. 换取钉钉侧 Token
+    async def process_login(self, code: str, grant_type: str, client_id: str, client_secret: str):
+        """透传 ClientID 和 ClientSecret 处理登录"""
         user_access_resp = httpx.post(
             "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
             json={
-                "clientId": settings.dt_client_id,
-                "clientSecret": settings.dt_client_secret,
+                "clientId": client_id,
+                "clientSecret": client_secret,
                 "code": code,
                 "grantType": grant_type
             }
         ).json()
-        user_access_token = user_access_resp.get('accessToken')
-        if not user_access_token: return {}
 
-        # 2. 获取 UnionId
+        user_access_token = user_access_resp.get('accessToken')
+        if not user_access_token:
+            logging.error(f"Code 换取 Token 失败: {user_access_resp}")
+            return {}
+
         me_resp = httpx.get(
             "https://api.dingtalk.com/v1.0/contact/users/me",
             headers={"x-acs-dingtalk-access-token": user_access_token}
         ).json()
         unionid = me_resp.get('unionId')
 
-        # 3. 缓存校验及 OIDC Token 生成
         user_name, oidc_token = self.cache_manager.get_valid_token(unionid)
         if not oidc_token:
-            user_info = self._get_user_info_from_dingtalk(unionid)
+            user_info = self._get_user_info_from_dingtalk(unionid, client_id, client_secret)
             user_name = user_info.get('name') if user_info else None
+
             if not user_name: return {}
 
-            oidc_token = self._generate_oidc_token(user_name)
+            oidc_token = self._generate_oidc_token(user_name, client_id)
             self.cache_manager.set_user_token(unionid, user_name, oidc_token)
 
-        # 返回标准的 OIDC Token 响应
+        logging.info(f"用户 {Fore.GREEN}{user_name}{Fore.RESET} 登录流程处理完成 (Client: {client_id[:6]}...)。")
+
         return {
             'access_token': oidc_token,
-            'id_token': oidc_token,  # OIDC 必须返回 id_token
+            'id_token': oidc_token,
             'token_type': 'Bearer',
             'expires_in': settings.user_token_cache_expire,
             'refresh_token': user_access_resp.get('refreshToken')
@@ -216,16 +234,17 @@ class DingTalkHandler:
 dingtalk_handler = DingTalkHandler()
 
 
+# --- 路由配置 ---
+
 @app.get("/config-check")
 async def check_config():
-    """测试接口：检查配置是否正确加载（生产环境请移除敏感信息）"""
+    """测试接口（生产环境建议移除）"""
     return {
         "issuer": settings.oidc_issuer,
         "cache_path": settings.cache_file_path,
         "grafana_org": settings.grafana_organizations
     }
 
-# --- OIDC 标准路由 ---
 
 @app.get("/.well-known/openid-configuration")
 async def openid_configuration():
@@ -253,7 +272,7 @@ async def jwks():
 
 @app.get("/dingtalk/oauth")
 async def dingtalk_oauth(redirect_uri: str, response_type: str, client_id: str, scope: str = "openid", state: str = ""):
-    # 引导至钉钉登录
+    """引导至钉钉登录"""
     return RedirectResponse(
         url=f"https://login.dingtalk.com/oauth2/auth?"
             f"redirect_uri={redirect_uri}"
@@ -267,10 +286,22 @@ async def dingtalk_oauth(redirect_uri: str, response_type: str, client_id: str, 
 
 @app.post("/dingtalk/token")
 async def dingtalk_token(request: Request):
-    """Token 交换端点"""
-    # 兼容处理 x-www-form-urlencoded 格式
+    """Token 交换端点，动态提取并透传凭证"""
     body = await request.body()
     params = parse_qs(body.decode('utf-8'))
+
+    # 1. 尝试从表单获取客户端凭证
+    client_id = params.get('client_id', [None])[0]
+    client_secret = params.get('client_secret', [None])[0]
+
+    # 2. 兼容从 HTTP Basic Auth 中获取 (如 Dify 默认行为)
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Basic '):
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+            client_id, client_secret = decoded.split(':', 1)
+        except Exception as e:
+            logging.error(f"解析 Basic Auth 失败: {e}")
 
     code = params.get('code', [None])[0]
     grant_type = params.get('grant_type', [None])[0]
@@ -278,8 +309,13 @@ async def dingtalk_token(request: Request):
     if grant_type == 'refresh_token':
         return {"error": "unsupported_grant_type"}
 
+    if not client_id or not client_secret:
+        logging.warning(f"{Fore.RED}拦截: 请求未包含合法的 Client 凭证{Style.RESET_ALL}")
+        return {"error": "invalid_client", "error_description": "Missing client credentials"}
+
     if code and grant_type:
-        return await dingtalk_handler.process_login(code, grant_type)
+        return await dingtalk_handler.process_login(code, grant_type, client_id, client_secret)
+
     return {"error": "invalid_request"}
 
 
@@ -292,13 +328,13 @@ async def dingtalk_userinfo(request: Request):
 
     token = token_header.split(' ')[1]
     try:
-        # 使用动态生成的 RSA 公钥验证，强制校验受众和签发者
+        # 透传模式下，不同客户端拥有不同的 aud，因此此处关闭 verify_aud，只验证签名和签发者
         payload = jwt.decode(
             token,
             key_manager.public_key,
             algorithms=["RS256"],
-            audience=settings.dt_client_id,
-            issuer=settings.oidc_issuer
+            issuer=settings.oidc_issuer,
+            options={"verify_aud": False}
         )
         return payload
     except jwt.PyJWTError as e:
@@ -311,12 +347,10 @@ if __name__ == "__main__":
 
     logging.info(f"{Fore.GREEN}启动 OIDC 网关，监听地址: {settings.server_host}:{settings.server_port}{Style.RESET_ALL}")
 
-    # 推荐传入字符串 "main:app" 以支持未来的 reload 参数，或者直接传 app 对象
     uvicorn.run(
         "main:app",
         host=settings.server_host,
         port=settings.server_port,
         log_level=settings.log_level.lower(),
-        # 如果是在开发环境，可以加上 reload=True
         reload=False
     )
