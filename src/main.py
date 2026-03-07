@@ -11,37 +11,22 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 import httpx
 from colorama import Fore, Style, init
-from pydantic_settings import BaseSettings, SettingsConfigDict
 import pickle
+from config import settings
 
-# --- 配置管理 ---
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-
-    dt_client_id: str
-    dt_client_secret: str
-    grafana_organizations: str
-
-    # OIDC 签发者 URL，例如你的服务外网地址 "https://sso.yourdomain.com"
-    oidc_issuer: str = "http://localhost:8000"
-    user_token_cache_expire: int = 60 * 60 * 24 * 7
-
-
-settings = Settings()
 init(autoreset=True)
-app = FastAPI()
-
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level.upper()),
     format=f'{Fore.BLUE}level={Fore.RESET}%(levelname)s {Fore.BLUE}ts={Fore.RESET}%(asctime)s {Fore.BLUE}caller={Fore.RESET}%(filename)s:%(lineno)d {Fore.BLUE}msg={Fore.RESET}%(message)s',
     encoding='utf-8',
     datefmt='%Y-%m-%dT%H:%M:%S'
 )
 
+app = FastAPI()
 
 # --- RSA 密钥管理 (用于 RS256 和 JWKS) ---
 class KeyManager:
-    def __init__(self, key_path='user/oidc_rsa.pem'):
+    def __init__(self, key_path=settings.rsa_key_path):
         self.key_path = key_path
         os.makedirs(os.path.dirname(self.key_path), exist_ok=True)
         self.private_key, self.public_key = self._load_or_generate_key()
@@ -76,8 +61,7 @@ key_manager = KeyManager()
 
 # --- 数据持久化 (Pickle 版本) ---
 class UserTokenCache:
-    def __init__(self, file_path='user/userinfo.pkl'):
-        # 将默认后缀改为 .pkl
+    def __init__(self, file_path=settings.cache_file_path):
         self.file_path = file_path
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
 
@@ -232,6 +216,15 @@ class DingTalkHandler:
 dingtalk_handler = DingTalkHandler()
 
 
+@app.get("/config-check")
+async def check_config():
+    """测试接口：检查配置是否正确加载（生产环境请移除敏感信息）"""
+    return {
+        "issuer": settings.oidc_issuer,
+        "cache_path": settings.cache_file_path,
+        "grafana_org": settings.grafana_organizations
+    }
+
 # --- OIDC 标准路由 ---
 
 @app.get("/.well-known/openid-configuration")
@@ -311,3 +304,19 @@ async def dingtalk_userinfo(request: Request):
     except jwt.PyJWTError as e:
         logging.error(f"Token 解析失败: {e}")
         return {"error": "Invalid Token"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    logging.info(f"{Fore.GREEN}启动 OIDC 网关，监听地址: {settings.server_host}:{settings.server_port}{Style.RESET_ALL}")
+
+    # 推荐传入字符串 "main:app" 以支持未来的 reload 参数，或者直接传 app 对象
+    uvicorn.run(
+        "main:app",
+        host=settings.server_host,
+        port=settings.server_port,
+        log_level=settings.log_level.lower(),
+        # 如果是在开发环境，可以加上 reload=True
+        reload=False
+    )

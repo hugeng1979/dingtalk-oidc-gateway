@@ -1,6 +1,14 @@
 [project]
-name = "dintalk-oidc-gateway"
+name = "dingtalk-oidc-gateway"
 version = "0.1.0"
-description = "Add your description here"
+description = "A standard OIDC Provider gateway based on DingTalk OAuth"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",     # 运行 FastAPI 的 ASGI 服务器
+    "httpx>=0.27.0",                 # 异步 HTTP 客户端，用于请求钉钉 API
+    "PyJWT[crypto]>=2.8.0",          # JWT 处理，带上 [crypto] 以支持 RS256 非对称加密
+    "cryptography>=42.0.0",          # PyJWT crypto 选项的底层依赖，用于生成和加载 RSA 密钥对
+    "colorama>=0.4.6",               # 用于控制台日志的颜色输出
+    "pydantic-settings>=2.2.1",      # 用于管理 .env 和环境变量配置
+]
