@@ -184,14 +184,22 @@ class DingTalkHandler:
             return user_info.get('email')
         elif strategy == 'org_email':
             return user_info.get('org_email')
-        elif strategy == 'userid':
+        elif strategy == 'userid_email':
             return f"{userid}@userid.dingtalk"
-        elif strategy == 'unionid':
+        elif strategy == 'unionid_email':
             return f"{unionid}@unionid.dingtalk"
-        elif strategy == 'name':
+        elif strategy == 'name_email':
             return f"{name}@name.dingtalk"
-        elif strategy == 'name_uri':
+        elif strategy == 'name_uri_email':
             return f"{quote(name)}@name.dingtalk"
+        elif strategy == 'userid':
+            return userid
+        elif strategy == 'unionid':
+            return unionid
+        elif strategy == 'name':
+            return name
+        elif strategy == 'name_uri':
+            return quote(name)
         else:
             return ''
 
