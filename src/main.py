@@ -23,7 +23,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%dT%H:%M:%S'
 )
 
-app = FastAPI()
+# 按配置启停交互式 API 文档（生产默认禁用，防止接口结构泄露）
+app = FastAPI(
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url="/redoc" if settings.docs_enabled else None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
+)
 
 
 # --- RSA 密钥管理 (用于 RS256 和 JWKS) ---

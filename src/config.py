@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # --- 日志配置 ---
     log_level: str = "INFO"
 
+    # --- API 文档配置 ---
+    # 生产默认禁用 /docs /redoc /openapi.json（防止接口结构泄露）；本地调试在 .env 设 DOCS_ENABLED=true 开启
+    docs_enabled: bool = False
+
     client_email_mapping: str = ""
 
     model_config = SettingsConfigDict(
