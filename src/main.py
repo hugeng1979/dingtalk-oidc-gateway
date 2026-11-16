@@ -3,9 +3,9 @@ import time
 import os
 import json
 import base64
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 import jwt
 from jwt.algorithms import RSAAlgorithm
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -23,7 +23,52 @@ logging.basicConfig(
     datefmt='%Y-%m-%dT%H:%M:%S'
 )
 
-app = FastAPI()
+# 生产环境默认关闭 Swagger 文档，仅本地调试通过 DOCS_ENABLED=true 开启
+app = FastAPI(
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
+)
+
+
+def _issuer() -> str:
+    """获取去除末尾斜杠的 issuer 标准值（discovery 与 JWT 签发/校验共用）"""
+    return settings.oidc_issuer.rstrip('/')
+
+
+# --- 敏感信息脱敏工具（用于日志输出） ---
+SENSITIVE_KEYS = {"accesstoken", "refreshtoken", "access_token", "refresh_token",
+                  "clientsecret", "client_secret", "mobile", "email", "sessionid"}
+
+
+def _mask(value: str, keep: int = 4) -> str:
+    """脱敏字符串：保留首尾各 keep 位，中间以 *** 代替"""
+    if not value or not isinstance(value, str) or len(value) <= keep * 2:
+        return "***"
+    return f"{value[:keep]}***{value[-keep:]}"
+
+
+def _mask_payload(data: dict) -> dict:
+    """递归脱敏字典中的敏感字段"""
+    result = {}
+    for key, value in (data or {}).items():
+        if isinstance(value, dict):
+            result[key] = _mask_payload(value)
+        elif isinstance(value, str) and key.lower() in SENSITIVE_KEYS:
+            result[key] = _mask(value)
+        else:
+            result[key] = value
+    return result
+
+
+class OAuthTokenError(Exception):
+    """Token 端点标准 OAuth2 错误异常"""
+
+    def __init__(self, error: str, description: str, status_code: int = 400):
+        self.error = error
+        self.description = description
+        self.status_code = status_code
+        super().__init__(description)
 
 
 # --- RSA 密钥管理 (用于 RS256 和 JWKS) ---
@@ -123,6 +168,7 @@ class DingTalkHandler:
             "https://api.dingtalk.com/v1.0/oauth2/accessToken",
             json={"appKey": client_id, "appSecret": client_secret}
         ).json()
+        logging.debug(f"钉钉 accessToken 接口原始响应: {_mask_payload(resp)}")
 
         token = resp.get('accessToken')
         expire_in = resp.get('expireIn', 7200)
@@ -134,8 +180,8 @@ class DingTalkHandler:
             }
             return token
 
-        logging.error(f"获取 App AccessToken 失败: {resp}")
-        raise Exception("DingTalk App Token Error")
+        logging.error(f"获取 App AccessToken 失败: {_mask_payload(resp)}")
+        raise OAuthTokenError("server_error", "钉钉 App AccessToken 获取失败，请检查 AppKey/AppSecret", 502)
 
     def _get_user_info_from_dingtalk(self, unionid: str, client_id: str, client_secret: str):
         app_token = self._get_app_access_token(client_id, client_secret)
@@ -145,10 +191,11 @@ class DingTalkHandler:
             params={"access_token": app_token},
             json={"unionid": unionid}
         ).json()
+        logging.debug(f"钉钉 getbyunionid 接口原始响应: {_mask_payload(userid_resp)}")
         userid = userid_resp.get('result', {}).get('userid')
 
         if not userid:
-            logging.error(f"无法根据 UnionId 获取 UserId: {userid_resp}")
+            logging.error(f"无法根据 UnionId 获取 UserId: {_mask_payload(userid_resp)}")
             return None
 
         user_info_resp = httpx.post(
@@ -156,12 +203,12 @@ class DingTalkHandler:
             params={"access_token": app_token},
             json={"userid": userid}
         ).json()
+        logging.debug(f"钉钉 user/get 接口原始响应: {_mask_payload(user_info_resp)}")
         return user_info_resp.get('result', {})
 
     @staticmethod
     def _get_dynamic_email(user_info: dict, redirect_uri: str) -> str:
         """根据 redirect_uri 的特征关键词解析邮箱策略"""
-        # 注意：要在 config.py 的 Settings 类中增加 client_email_mapping: str = ""
         rule_str = getattr(settings, 'client_email_mapping', '').strip()
         strategy = "email"  # 默认策略为真实邮箱
 
@@ -181,9 +228,10 @@ class DingTalkHandler:
         name = user_info.get('name', 'Unknown')
 
         if strategy == 'email':
-            return user_info.get('email')
+            # 真实邮箱优先，钉钉资料缺失时回退合成邮箱，保证下游 email 字段必存在
+            return user_info.get('email') or f"{userid}@userid.dingtalk"
         elif strategy == 'org_email':
-            return user_info.get('org_email')
+            return user_info.get('org_email') or f"{userid}@userid.dingtalk"
         elif strategy == 'userid_email':
             return f"{userid}@userid.dingtalk"
         elif strategy == 'unionid_email':
@@ -229,7 +277,7 @@ class DingTalkHandler:
         app_role = 'Admin' if is_admin else 'Viewer'
 
         payload = {
-            'iss': settings.oidc_issuer,
+            'iss': _issuer(),
             'sub': userid,  # 强烈建议用 userid 或 unionid 作为全局唯一标识
             'aud': client_id,
             'exp': now + settings.user_token_cache_expire,
@@ -273,17 +321,22 @@ class DingTalkHandler:
                 "grantType": grant_type
             }
         ).json()
+        logging.debug(f"钉钉 userAccessToken 接口原始响应: {_mask_payload(user_access_resp)}")
 
         user_access_token = user_access_resp.get('accessToken')
         if not user_access_token:
-            logging.error(f"Code 换取 Token 失败: {user_access_resp}")
-            return {}
+            logging.error(f"Code 换取 Token 失败: {_mask_payload(user_access_resp)}")
+            raise OAuthTokenError("invalid_grant", "钉钉授权码换取用户 Token 失败，授权码无效或已过期")
 
         me_resp = httpx.get(
             "https://api.dingtalk.com/v1.0/contact/users/me",
             headers={"x-acs-dingtalk-access-token": user_access_token}
         ).json()
+        logging.debug(f"钉钉 users/me 接口原始响应: {_mask_payload(me_resp)}")
         unionid = me_resp.get('unionId')
+        if not unionid:
+            logging.error(f"获取用户 unionId 失败: {_mask_payload(me_resp)}")
+            raise OAuthTokenError("server_error", "钉钉用户信息接口返回异常，缺少 unionId", 502)
 
         # 1. 尝试从缓存提取完整 UserInfo
         user_info = self.cache_manager.get_valid_user_info(unionid)
@@ -291,7 +344,7 @@ class DingTalkHandler:
             # 2. 缓存中没有，去钉钉拉取
             user_info = self._get_user_info_from_dingtalk(unionid, client_id, client_secret)
             if not user_info:
-                return {}
+                raise OAuthTokenError("server_error", "无法根据 UnionId 获取钉钉用户详情", 502)
             self.cache_manager.set_user_info(unionid, user_info)
 
         # 3. 动态签发（携带回调地址用于策略判断）
@@ -313,47 +366,66 @@ dingtalk_handler = DingTalkHandler()
 
 
 # --- 路由配置 ---
+# 同时注册根路径与 /dingtalk 前缀两套路由：
+# - Nginx 对 /dingtalk/ 去前缀转发时命中根路径路由（当前生产模式，见 docs/nginx-gateway.conf）
+# - Nginx 原样转发时命中 /dingtalk 前缀路由（兼容历史下游直连）
 @app.get("/.well-known/openid-configuration")
 async def openid_configuration():
-    """OIDC 自动发现端点"""
-    issuer = settings.oidc_issuer.rstrip('/')
+    """OIDC 自动发现端点：所有对外地址基于 OIDC_ISSUER 拼接"""
+    issuer = _issuer()
     return {
         "issuer": issuer,
-        "authorization_endpoint": f"{issuer}/dingtalk/oauth",
-        "token_endpoint": f"{issuer}/dingtalk/token",
-        "userinfo_endpoint": f"{issuer}/dingtalk/userinfo",
-        "jwks_uri": f"{issuer}/dingtalk/keys",
+        "authorization_endpoint": f"{issuer}/oauth",
+        "token_endpoint": f"{issuer}/token",
+        "userinfo_endpoint": f"{issuer}/userinfo",
+        "jwks_uri": f"{issuer}/keys",
         "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "grant_types_supported": ["authorization_code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
-        "claims_supported": ["sub", "iss", "aud", "exp", "iat", "name", "email", "groups", "organizations"],
-        "scopes_supported": ["openid", "profile", "email"]
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
+        "scopes_supported": ["openid", "profile", "email"],
+        "claims_supported": [
+            "sub", "iss", "aud", "exp", "iat",
+            "name", "preferred_username", "email", "picture",
+            "groups", "organizations", "unionid",
+        ],
     }
 
 
+@app.get("/keys")
 @app.get("/dingtalk/keys")
 async def jwks():
     """提供公钥供第三方应用验证 Token"""
     return key_manager.get_jwks()
 
 
+@app.get("/oauth")
 @app.get("/dingtalk/oauth")
 async def dingtalk_oauth(redirect_uri: str, response_type: str, client_id: str, scope: str = "openid", state: str = ""):
-    """引导至钉钉登录"""
+    """引导至钉钉登录：透传 client_id/redirect_uri/state，scope 归一化为钉钉支持的 openid"""
+    logging.info(f"授权跳转请求: client_id={client_id} scope={scope} redirect_uri={redirect_uri}")
+    params = {
+        "redirect_uri": redirect_uri,
+        "response_type": response_type,
+        "client_id": client_id,
+        # 钉钉授权端点仅支持 openid，下游传入的 email/profile 等一律丢弃
+        "scope": "openid",
+        "prompt": "consent",
+    }
+    if state:
+        params["state"] = state
+    # 必须 urlencode，避免 scope 空格、回调地址中的特殊字符破坏跳转 URL
     return RedirectResponse(
-        url=f"https://login.dingtalk.com/oauth2/auth?"
-            f"redirect_uri={redirect_uri}"
-            f"&response_type={response_type}"
-            f"&client_id={client_id}"
-            f"&scope={scope}"
-            f"&state={state}"
-            f"&prompt=consent",
+        url=f"https://login.dingtalk.com/oauth2/auth?{urlencode(params)}",
         status_code=302)
 
 
+@app.post("/token")
 @app.post("/dingtalk/token")
 async def dingtalk_token(request: Request):
-    """Token 交换端点，动态提取凭证和回调地址"""
+    """Token 交换端点：兼容 Form 与 Basic 两种凭证方式，失败返回标准 OAuth2 错误"""
     body = await request.body()
     params = parse_qs(body.decode('utf-8'))
 
@@ -362,37 +434,64 @@ async def dingtalk_token(request: Request):
     # 提取回调地址，交给业务层做邮箱分配策略判断
     redirect_uri = params.get('redirect_uri', [''])[0]
 
-    # 兼容从 HTTP Basic Auth 中获取 (如 Dify 默认行为)
+    # 兼容从 HTTP Basic Auth 中获取 (authentik 默认以 Basic 方式传递凭证)
     auth_header = request.headers.get('Authorization')
     if auth_header and auth_header.startswith('Basic '):
         try:
             decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
-            client_id, client_secret = decoded.split(':', 1)
+            basic_id, basic_secret = decoded.split(':', 1)
+            if basic_id:
+                client_id = basic_id
+            if basic_secret:
+                client_secret = basic_secret
         except Exception as e:
-            logging.error(f"解析 Basic Auth 失败: {e}")
+            logging.warning(f"解析 Basic Auth 失败: {e}")
 
     code = params.get('code', [None])[0]
     grant_type = params.get('grant_type', [None])[0]
 
-    if grant_type == 'refresh_token':
-        return {"error": "unsupported_grant_type"}
+    logging.info(f"收到 Token 请求: client_id={client_id} grant_type={grant_type} redirect_uri={redirect_uri}")
+
+    if grant_type != 'authorization_code':
+        logging.warning(f"拦截: 不支持的授权类型 {grant_type}")
+        return JSONResponse(status_code=400, content={
+            "error": "unsupported_grant_type",
+            "error_description": f"仅支持 authorization_code，收到: {grant_type}",
+        })
 
     if not client_id or not client_secret:
         logging.warning(f"{Fore.RED}拦截: 请求未包含合法的 Client 凭证{Style.RESET_ALL}")
-        return {"error": "invalid_client", "error_description": "Missing client credentials"}
+        return JSONResponse(status_code=401, content={
+            "error": "invalid_client",
+            "error_description": "缺少 client_id/client_secret（支持表单或 Basic Auth 方式）",
+        }, headers={"WWW-Authenticate": "Basic"})
 
-    if code and grant_type:
+    if not code:
+        return JSONResponse(status_code=400, content={
+            "error": "invalid_request",
+            "error_description": "缺少 code 参数",
+        })
+
+    try:
         return await dingtalk_handler.process_login(code, grant_type, client_id, client_secret, redirect_uri)
+    except OAuthTokenError as e:
+        logging.error(f"{Fore.RED}Token 请求处理失败: {e.error} - {e.description}{Style.RESET_ALL}")
+        return JSONResponse(status_code=e.status_code, content={
+            "error": e.error,
+            "error_description": e.description,
+        })
 
-    return {"error": "invalid_request"}
 
-
+@app.get("/userinfo")
 @app.get("/dingtalk/userinfo")
 async def dingtalk_userinfo(request: Request):
-    """返回用户信息"""
+    """返回用户信息：无效或缺失 Token 时返回 401，避免下游误将错误体当作用户信息解析"""
     token_header = request.headers.get('Authorization')
     if not token_header or not token_header.startswith("Bearer "):
-        return {"error": "Unauthorized"}
+        return JSONResponse(status_code=401, content={
+            "error": "invalid_token",
+            "error_description": "缺少 Bearer Token",
+        })
 
     token = token_header.split(' ')[1]
     try:
@@ -401,13 +500,17 @@ async def dingtalk_userinfo(request: Request):
             token,
             key_manager.public_key,
             algorithms=["RS256"],
-            issuer=settings.oidc_issuer,
+            issuer=_issuer(),
             options={"verify_aud": False}
         )
+        logging.info(f"UserInfo 请求成功: sub={payload.get('sub')} name={payload.get('name')}")
         return payload
     except jwt.PyJWTError as e:
         logging.error(f"Token 解析失败: {e}")
-        return {"error": "Invalid Token"}
+        return JSONResponse(status_code=401, content={
+            "error": "invalid_token",
+            "error_description": "Token 无效或已过期",
+        })
 
 
 if __name__ == "__main__":

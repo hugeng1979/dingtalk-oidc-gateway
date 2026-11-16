@@ -1,0 +1,13 @@
+# 环境变量（含发布地址与邮箱策略），不提交
+.env
+
+# RSA 私钥与用户缓存（运行时生成），不提交
+data/
+
+# IDE 与系统文件
+.idea/
+.DS_Store
+
+# Python 产物
+__pycache__/
+*.pyc

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # --- 日志配置 ---
     log_level: str = "INFO"
 
+    # --- 本地调试 ---
+    docs_enabled: bool = False  # 开启后暴露 /docs Swagger 文档，生产环境保持关闭
+
     client_email_mapping: str = ""
 
     model_config = SettingsConfigDict(

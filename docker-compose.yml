@@ -1,0 +1,25 @@
+services:
+  dingtalk-oidc:
+    # 基于项目 Dockerfile 构建（python:3.12-slim + uv 安装 FastAPI 依赖；依赖装进镜像，代码由挂载注入）
+    build: .
+    container_name: dingtalk-oidc-gateway
+    restart: unless-stopped
+    ports:
+      # 宿主机 9011 → 容器 8000（9010 已被 authentik-sso-gateway 占用）
+      - '9011:8000'
+    env_file:
+      # 全部配置（OIDC_ISSUER / CLIENT_EMAIL_MAPPING 等）通过 .env 注入
+      - .env
+    environment:
+      # 容器时区：日志时间戳按北京时间
+      - TZ=Asia/Shanghai
+    volumes:
+      # 代码整目录挂载到镜像工作目录：改 src/ 下 py 代码只需 restart 即生效（无需 --build）
+      - ./src:/opt/fastapi-app
+      # 持久化 RSA 签名私钥与用户资料缓存（丢失则已签发 token 全部失效）
+      - ./data:/opt/fastapi-app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
