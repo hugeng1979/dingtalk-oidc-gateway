@@ -11,3 +11,5 @@ data/
 # Python 产物
 __pycache__/
 *.pyc
+
+docs/nginx-gateway.conf
